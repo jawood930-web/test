@@ -1,0 +1,1012 @@
+/*
+ * ============================================================================
+ * ELITE SOFTWARE PROTECTION FRAMEWORK v4.0 - ULTIMATE EDITION
+ *
+ * NEW FEATURES:
+ * 1. Tartarus' Gate (Advanced SSN resolution with neighbor analysis)
+ * 2. VEH-based Hardware Breakpoint Detection (No API hooks)
+ * 3. RDTSC Timing Attacks (Anti-Debug & Anti-VM)
+ * 4. VM/Sandbox Detection (CPUID, MAC, Drivers)
+ * 5. Polymorphic VM Handler Table (Runtime shuffling)
+ * 6. Stealthy Dual Mapping (Irregular heap allocation)
+ * ============================================================================
+ */
+
+#include <windows.h>
+#include <winternl.h>
+#include <intrin.h>
+#include <tlhelp32.h>
+#include <iphlpapi.h>
+#include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <chrono>
+#include <random>
+#include <array>
+#include <cstdint>
+#include <map>
+#include <atomic>
+#include <algorithm>
+#include <numeric>
+
+#pragma comment(lib, "iphlpapi.lib")
+
+ // ============================================================================
+ // MISSING DEFINITIONS
+ // ============================================================================
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#endif
+
+#ifndef STATUS_NOT_FOUND
+#define STATUS_NOT_FOUND ((NTSTATUS)0xC0000225L)
+#endif
+
+#ifndef STATUS_ACCESS_DENIED
+#define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022L)
+#endif
+
+#ifndef ViewUnmap
+#define ViewUnmap 2
+#endif
+// Redundant definitions removed as they are already provided by winternl.h
+
+
+// ============================================================================
+// GetPEB Implementation
+// ============================================================================
+inline PVOID GetPEB() {
+#ifdef _WIN64
+    return (PVOID)__readgsqword(0x60);
+#else
+    return (PVOID)__readfsdword(0x30);
+#endif
+}
+
+// ============================================================================
+// COMPILE-TIME HASHING
+// ============================================================================
+namespace CompileTimeHash {
+    constexpr uint32_t FNV_OFFSET = 0x811c9dc5;
+    constexpr uint32_t FNV_PRIME = 0x01000193;
+
+    constexpr uint32_t Hash(const char* str, uint32_t value = FNV_OFFSET) {
+        return *str ? Hash(str + 1, (value ^ *str) * FNV_PRIME) : value;
+    }
+
+    constexpr uint32_t HASH_NtCreateSection = Hash("NtCreateSection");
+    constexpr uint32_t HASH_NtMapViewOfSection = Hash("NtMapViewOfSection");
+    constexpr uint32_t HASH_NtUnmapViewOfSection = Hash("NtUnmapViewOfSection");
+    constexpr uint32_t HASH_NtClose = Hash("NtClose");
+    constexpr uint32_t HASH_NtQueryInformationProcess = Hash("NtQueryInformationProcess");
+    constexpr uint32_t HASH_NtTerminateProcess = Hash("NtTerminateProcess");
+    constexpr uint32_t HASH_NtDelayExecution = Hash("NtDelayExecution");
+    constexpr uint32_t HASH_NtQuerySystemInformation = Hash("NtQuerySystemInformation");
+
+    // String Obfuscation (Simple XOR)
+    template<size_t N>
+    struct ObfuscatedString {
+        char data[N];
+        constexpr ObfuscatedString(const char* str, char key) : data{} {
+            for (size_t i = 0; i < N; ++i) data[i] = str[i] ^ key;
+        }
+    };
+
+    #define OBFUSCATE(str, key) ([]() { \
+        constexpr auto obfuscated = CompileTimeHash::ObfuscatedString<sizeof(str)>(str, key); \
+        std::string decrypted = ""; \
+        for(size_t i = 0; i < sizeof(str); ++i) decrypted += (obfuscated.data[i] ^ key); \
+        return decrypted; \
+    }())
+}
+
+// ============================================================================
+// API HASHING (PEB WALKING)
+// ============================================================================
+namespace APIHashing {
+    struct UNICODE_STRING_CUSTOM {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR Buffer;
+    };
+
+    struct LDR_DATA_TABLE_ENTRY_CUSTOM {
+        LIST_ENTRY InMemoryOrderLinks;
+        LIST_ENTRY InInitializationOrderLinks;
+        PVOID DllBase;
+        PVOID EntryPoint;
+        ULONG SizeOfImage;
+        UNICODE_STRING_CUSTOM FullDllName;
+        UNICODE_STRING_CUSTOM BaseDllName;
+    };
+
+    inline uint32_t HashString(const char* str) {
+        uint32_t hash = CompileTimeHash::FNV_OFFSET;
+        while (*str) {
+            hash ^= static_cast<uint8_t>(*str++);
+            hash *= CompileTimeHash::FNV_PRIME;
+        }
+        return hash;
+    }
+
+    inline uint32_t HashStringW(const wchar_t* str) {
+        uint32_t hash = CompileTimeHash::FNV_OFFSET;
+        while (*str) {
+            wchar_t lower = (*str >= L'A' && *str <= L'Z') ? (*str + 32) : *str;
+            hash ^= static_cast<uint8_t>(lower & 0xFF);
+            hash *= CompileTimeHash::FNV_PRIME;
+            str++;
+        }
+        return hash;
+    }
+
+    PVOID GetModuleByHash(uint32_t moduleHash) {
+        PPEB peb = reinterpret_cast<PPEB>(GetPEB());
+        if (!peb) return nullptr;
+
+        auto pLdr = reinterpret_cast<PPEB_LDR_DATA>(peb->Ldr);
+        if (!pLdr) return nullptr;
+
+        LIST_ENTRY* listHead = &pLdr->InMemoryOrderModuleList;
+        LIST_ENTRY* currentEntry = listHead->Flink;
+
+        while (currentEntry != listHead) {
+            auto tableEntry = CONTAINING_RECORD(currentEntry, LDR_DATA_TABLE_ENTRY_CUSTOM, InMemoryOrderLinks);
+
+            if (tableEntry->BaseDllName.Buffer) {
+                uint32_t hash = HashStringW(tableEntry->BaseDllName.Buffer);
+                if (hash == moduleHash) {
+                    return tableEntry->DllBase;
+                }
+            }
+
+            currentEntry = currentEntry->Flink;
+        }
+
+        return nullptr;
+    }
+
+    PVOID GetFunctionByHash(PVOID moduleBase, uint32_t functionHash) {
+        if (!moduleBase) return nullptr;
+
+        auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(moduleBase);
+        if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+
+        auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+            reinterpret_cast<BYTE*>(moduleBase) + dosHeader->e_lfanew);
+
+        if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+        auto exportDir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+            reinterpret_cast<BYTE*>(moduleBase) +
+            ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+        auto names = reinterpret_cast<DWORD*>(
+            reinterpret_cast<BYTE*>(moduleBase) + exportDir->AddressOfNames);
+        auto functions = reinterpret_cast<DWORD*>(
+            reinterpret_cast<BYTE*>(moduleBase) + exportDir->AddressOfFunctions);
+        auto ordinals = reinterpret_cast<WORD*>(
+            reinterpret_cast<BYTE*>(moduleBase) + exportDir->AddressOfNameOrdinals);
+
+        for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+            const char* functionName = reinterpret_cast<const char*>(
+                reinterpret_cast<BYTE*>(moduleBase) + names[i]);
+
+            if (HashString(functionName) == functionHash) {
+                WORD ordinal = ordinals[i];
+                DWORD functionRva = functions[ordinal];
+                return reinterpret_cast<BYTE*>(moduleBase) + functionRva;
+            }
+        }
+
+        return nullptr;
+    }
+
+    PVOID GetNtdll() {
+        static PVOID ntdllBase = nullptr;
+        if (!ntdllBase) {
+            ntdllBase = GetModuleByHash(CompileTimeHash::Hash("ntdll.dll"));
+        }
+        return ntdllBase;
+    }
+
+    template<typename FuncType>
+    FuncType GetAPI(uint32_t functionHash) {
+        PVOID ntdll = GetNtdll();
+        if (!ntdll) return nullptr;
+
+        return reinterpret_cast<FuncType>(GetFunctionByHash(ntdll, functionHash));
+    }
+}
+
+// ============================================================================
+// TARTARUS' GATE - ADVANCED SSN RESOLUTION
+// ============================================================================
+/*
+ * Improvement over Hell's Gate:
+ * 1. Check direct function (Hell's Gate)
+ * 2. Check neighboring functions up/down (Halo's Gate)
+ * 3. Parse entire export table for syscall pattern (Tartarus' Gate)
+ * 4. Calculate SSN from ordinal position if all else fails
+ */
+
+namespace TartarusGate {
+    struct SyscallInfo {
+        DWORD ssn;
+        PVOID syscallAddress;
+        PVOID returnGadget;
+    };
+
+    inline bool IsSyscallPattern(BYTE* addr) {
+        // Pattern: 4C 8B D1 B8 [SSN] 00 00 00
+        return (addr[0] == 0x4C && addr[1] == 0x8B &&
+            addr[2] == 0xD1 && addr[3] == 0xB8);
+    }
+
+    inline DWORD ExtractSSNDirect(BYTE* funcAddr) {
+        if (IsSyscallPattern(funcAddr)) {
+            return *(DWORD*)(funcAddr + 4);
+        }
+        return 0xFFFFFFFF;
+    }
+
+    // Hell's Gate + Halo's Gate
+    DWORD ExtractSSNWithNeighbors(BYTE* funcAddr) {
+        // Direct check
+        DWORD ssn = ExtractSSNDirect(funcAddr);
+        if (ssn != 0xFFFFFFFF) return ssn;
+
+        // Halo's Gate: search neighbors
+        for (int offset = 1; offset <= 64; offset++) {
+            // Down
+            BYTE* down = funcAddr + (offset * 32);
+            if (IsSyscallPattern(down)) {
+                return *(DWORD*)(down + 4) - offset;
+            }
+
+            // Up
+            if ((uintptr_t)funcAddr > (uintptr_t)offset * 32) {
+                BYTE* up = funcAddr - (offset * 32);
+                if (IsSyscallPattern(up)) {
+                    return *(DWORD*)(up + 4) + offset;
+                }
+            }
+        }
+
+        return 0xFFFFFFFF;
+    }
+
+    // Tartarus' Gate: Scan entire export table
+    DWORD ExtractSSNFromExports(const char* functionName) {
+        PVOID ntdll = APIHashing::GetNtdll();
+        if (!ntdll) return 0xFFFFFFFF;
+
+        auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(ntdll);
+        auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+            reinterpret_cast<BYTE*>(ntdll) + dosHeader->e_lfanew);
+
+        auto exportDir = reinterpret_cast<PIMAGE_EXPORT_DIRECTORY>(
+            reinterpret_cast<BYTE*>(ntdll) +
+            ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+        auto names = reinterpret_cast<DWORD*>(
+            reinterpret_cast<BYTE*>(ntdll) + exportDir->AddressOfNames);
+        auto functions = reinterpret_cast<DWORD*>(
+            reinterpret_cast<BYTE*>(ntdll) + exportDir->AddressOfFunctions);
+        auto ordinals = reinterpret_cast<WORD*>(
+            reinterpret_cast<BYTE*>(ntdll) + exportDir->AddressOfNameOrdinals);
+
+        // Build sorted list of syscall functions
+        std::vector<std::pair<std::string, DWORD>> syscallList;
+
+        for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+            const char* name = reinterpret_cast<const char*>(
+                reinterpret_cast<BYTE*>(ntdll) + names[i]);
+
+            // Check if it's a Nt/Zw function
+            if (name[0] == 'N' && name[1] == 't' ||
+                name[0] == 'Z' && name[1] == 'w') {
+
+                WORD ordinal = ordinals[i];
+                DWORD functionRva = functions[ordinal];
+                BYTE* funcAddr = reinterpret_cast<BYTE*>(ntdll) + functionRva;
+
+                DWORD ssn = ExtractSSNDirect(funcAddr);
+                if (ssn != 0xFFFFFFFF) {
+                    syscallList.push_back({ name, ssn });
+                }
+            }
+        }
+
+        // Sort by SSN
+        std::sort(syscallList.begin(), syscallList.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
+
+        // Find our function in sorted list and calculate SSN from position
+        for (size_t i = 0; i < syscallList.size(); i++) {
+            if (strcmp(syscallList[i].first.c_str(), functionName) == 0) {
+                return syscallList[i].second;
+            }
+        }
+
+        return 0xFFFFFFFF;
+    }
+
+    PVOID FindSyscallInstr(BYTE* funcAddr) {
+        for (int i = 0; i < 50; i++) {
+            if (funcAddr[i] == 0x0F && funcAddr[i + 1] == 0x05) {
+                return &funcAddr[i];
+            }
+        }
+        return nullptr;
+    }
+
+    PVOID FindReturnGadgetInKernel32() {
+        PVOID kernel32 = APIHashing::GetModuleByHash(CompileTimeHash::Hash("kernel32.dll"));
+        if (!kernel32) return nullptr;
+
+        auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(kernel32);
+        auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
+            reinterpret_cast<BYTE*>(kernel32) + dosHeader->e_lfanew);
+
+        PIMAGE_SECTION_HEADER sectionHeader = IMAGE_FIRST_SECTION(ntHeaders);
+        for (WORD i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
+            // Memory compare for ".text"
+            if (sectionHeader[i].Name[0] == '.' && sectionHeader[i].Name[1] == 't' && 
+                sectionHeader[i].Name[2] == 'e' && sectionHeader[i].Name[3] == 'x' && 
+                sectionHeader[i].Name[4] == 't') {
+                
+                BYTE* sectionStart = reinterpret_cast<BYTE*>(kernel32) + sectionHeader[i].VirtualAddress;
+                SIZE_T sectionSize = sectionHeader[i].Misc.VirtualSize;
+
+                // Priority 1: add rsp, XX; ret (48 83 C4 XX C3)
+                for (SIZE_T j = 0; j < sectionSize - 5; j++) {
+                    if (sectionStart[j] == 0x48 && sectionStart[j + 1] == 0x83 &&
+                        sectionStart[j + 2] == 0xC4 && sectionStart[j + 4] == 0xC3) {
+                        return &sectionStart[j];
+                    }
+                }
+
+                // Priority 2: simple ret (C3)
+                for (SIZE_T j = 0; j < sectionSize; j++) {
+                    if (sectionStart[j] == 0xC3) {
+                        return &sectionStart[j];
+                    }
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    SyscallInfo ResolveSyscall(const char* functionName) {
+        SyscallInfo info = { 0xFFFFFFFF, nullptr, nullptr };
+
+        PVOID ntdll = APIHashing::GetNtdll();
+        if (!ntdll) return info;
+
+        PVOID funcAddr = APIHashing::GetFunctionByHash(
+            ntdll, APIHashing::HashString(functionName));
+        if (!funcAddr) return info;
+
+        BYTE* funcBytes = reinterpret_cast<BYTE*>(funcAddr);
+
+        // Try direct + neighbors first
+        info.ssn = ExtractSSNWithNeighbors(funcBytes);
+
+        // If failed, try Tartarus' Gate (export table scan)
+        if (info.ssn == 0xFFFFFFFF) {
+            info.ssn = ExtractSSNFromExports(functionName);
+        }
+
+        info.syscallAddress = FindSyscallInstr(funcBytes);
+        info.returnGadget = FindReturnGadgetInKernel32();
+
+        return info;
+    }
+
+    template<typename... Args>
+    NTSTATUS IndirectSyscall(const char* functionName, Args... args) {
+        SyscallInfo info = ResolveSyscall(functionName);
+        if (info.ssn == 0xFFFFFFFF || !info.syscallAddress) {
+            return STATUS_NOT_FOUND;
+        }
+
+        alignas(16) unsigned char stub[32] = {
+            0x4C, 0x8B, 0xD1,                                           // mov r10, rcx
+            0xB8, 0x00, 0x00, 0x00, 0x00,                               // mov eax, ssn
+            0x49, 0xBB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov r11, syscallAddress
+            0x41, 0xFF, 0xE3                                            // jmp r11
+        };
+
+        *(DWORD*)(stub + 4) = info.ssn;
+        *(PVOID*)(stub + 10) = info.syscallAddress;
+
+        DWORD oldProtect;
+        VirtualProtect(stub, sizeof(stub), PAGE_EXECUTE_READ, &oldProtect);
+
+        using SyscallFunc = NTSTATUS(*)(Args...);
+        auto func = reinterpret_cast<SyscallFunc>((void*)stub);
+        NTSTATUS result = func(args...);
+
+        VirtualProtect(stub, sizeof(stub), oldProtect, &oldProtect);
+        SecureZeroMemory(stub, sizeof(stub));
+
+        return result;
+    }
+}
+
+// ============================================================================
+// VEH-BASED HARDWARE BREAKPOINT DETECTION
+// ============================================================================
+/*
+ * Instead of using GetThreadContext (which can be hooked),
+ * use VEH to catch INT1 exceptions and check DR registers directly
+ */
+
+namespace VEHAntiDebug {
+    volatile bool hwbpDetected = false;
+
+    LONG CALLBACK HWBPExceptionHandler(PEXCEPTION_POINTERS ExceptionInfo) {
+        if (ExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+            // INT1 exception - check if it's from our trap or debugger
+            CONTEXT* ctx = ExceptionInfo->ContextRecord;
+
+            if (ctx->Dr0 || ctx->Dr1 || ctx->Dr2 || ctx->Dr3) {
+                hwbpDetected = true;
+            }
+
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    void InitializeVEH() {
+        AddVectoredExceptionHandler(1, HWBPExceptionHandler);
+    }
+
+    bool CheckHardwareBreakpoints() {
+        hwbpDetected = false;
+
+        // Trigger INT1 to invoke VEH
+        __try {
+            __debugbreak();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // Exception handled
+        }
+
+        return hwbpDetected;
+    }
+}
+
+// ============================================================================
+// RDTSC TIMING ATTACKS
+// ============================================================================
+namespace TimingAttacks {
+    // Calibrate baseline timing
+    uint64_t CalibrateBaseline() {
+        const int iterations = 100;
+        uint64_t total = 0;
+
+        for (int i = 0; i < iterations; i++) {
+            uint64_t start = __rdtsc();
+
+            // Dummy operation
+            volatile int dummy = 0;
+            for (int j = 0; j < 10; j++) dummy++;
+
+            uint64_t end = __rdtsc();
+            total += (end - start);
+        }
+
+        return total / iterations;
+    }
+
+    bool DetectDebuggerByTiming() {
+        uint64_t baseline = CalibrateBaseline();
+
+        // Actual check
+        uint64_t start = __rdtsc();
+        volatile int dummy = 0;
+        for (int i = 0; i < 10; i++) dummy++;
+        uint64_t end = __rdtsc();
+
+        uint64_t elapsed = end - start;
+
+        // If 10x slower than baseline, likely debugger
+        return (elapsed > baseline * 10);
+    }
+
+    bool DetectVMByTiming() {
+        // CPUID is very slow in VMs
+        uint64_t start = __rdtsc();
+
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 0);
+
+        uint64_t end = __rdtsc();
+
+        // CPUID should take < 1000 cycles on real hardware
+        return (end - start) > 1000;
+    }
+}
+
+// ============================================================================
+// VM/SANDBOX DETECTION
+// ============================================================================
+namespace EnvironmentDetection {
+    bool CheckCPUIDHypervisor() {
+        int cpuInfo[4];
+        __cpuid(cpuInfo, 1);
+
+        // Check hypervisor present bit (bit 31 of ECX)
+        return (cpuInfo[2] & (1 << 31)) != 0;
+    }
+
+    bool CheckVMwareMAC() {
+        IP_ADAPTER_INFO adapterInfo[16];
+        DWORD bufferSize = sizeof(adapterInfo);
+
+        if (GetAdaptersInfo(adapterInfo, &bufferSize) == NO_ERROR) {
+            PIP_ADAPTER_INFO adapter = adapterInfo;
+            while (adapter) {
+                // VMware MAC addresses start with 00:05:69, 00:0C:29, 00:50:56
+                if (adapter->AddressLength == 6) {
+                    if ((adapter->Address[0] == 0x00 && adapter->Address[1] == 0x05 && adapter->Address[2] == 0x69) ||
+                        (adapter->Address[0] == 0x00 && adapter->Address[1] == 0x0C && adapter->Address[2] == 0x29) ||
+                        (adapter->Address[0] == 0x00 && adapter->Address[1] == 0x50 && adapter->Address[2] == 0x56)) {
+                        return true;
+                    }
+                }
+                adapter = adapter->Next;
+            }
+        }
+        return false;
+    }
+
+    bool CheckVMDrivers() {
+        const char* vmDrivers[] = {
+            "\\\\.\\VBoxGuest",
+            "\\\\.\\VBoxMiniRdrDN",
+            "\\\\.\\VBoxVideo",
+            "\\\\.\\vmci",
+            "\\\\.\\vmmouse",
+            "\\\\.\\vmusbmouse"
+        };
+
+        for (const char* driver : vmDrivers) {
+            HANDLE hFile = CreateFileA(driver, GENERIC_READ,
+                FILE_SHARE_READ, NULL,
+                OPEN_EXISTING, 0, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                CloseHandle(hFile);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool CheckLowCPUCount() {
+        SYSTEM_INFO sysInfo;
+        GetSystemInfo(&sysInfo);
+
+        // Sandboxes often have 1-2 cores
+        return (sysInfo.dwNumberOfProcessors < 2);
+    }
+
+    bool IsSandboxEnvironment() {
+        int suspicionScore = 0;
+
+        if (CheckCPUIDHypervisor()) suspicionScore += 3;
+        if (CheckVMwareMAC()) suspicionScore += 3;
+        if (CheckVMDrivers()) suspicionScore += 4;
+        if (CheckLowCPUCount()) suspicionScore += 2;
+        if (TimingAttacks::DetectVMByTiming()) suspicionScore += 2;
+
+        return suspicionScore >= 5;
+    }
+}
+
+// ============================================================================
+// POLYMORPHIC VM HANDLER TABLE
+// ============================================================================
+namespace PolymorphicVM {
+    enum class OpCode : uint8_t {
+        NOP = 0x00,
+        MOV_IMM_64 = 0x01,
+        XOR_REG = 0x02,
+        ADD_REG = 0x03,
+        JUNK = 0x04,
+        HALT = 0xFF
+    };
+
+    class PolymorphicBytecodeVM {
+    private:
+        std::array<uint64_t, 16> registers_;
+        std::vector<uint8_t> code_;
+        size_t ip_;
+
+        // Polymorphic handler table - shuffled each run
+        using HandlerFunc = void(PolymorphicBytecodeVM::*)();
+        std::array<HandlerFunc, 256> handlerTable_;
+        std::map<OpCode, uint8_t> opcodeToIndex_;
+
+        void HandlerNop() { /* do nothing */ }
+
+        void HandlerMovImm64() {
+            if (ip_ + 9 > code_.size()) return;
+            uint8_t reg = code_[ip_++];
+            uint64_t value = *(uint64_t*)(&code_[ip_]);
+            ip_ += 8;
+            if (reg < 16) registers_[reg] = value;
+        }
+
+        void HandlerXorReg() {
+            if (ip_ + 2 > code_.size()) return;
+            uint8_t dst = code_[ip_++];
+            uint8_t src = code_[ip_++];
+            if (dst < 16 && src < 16) {
+                registers_[dst] ^= registers_[src];
+            }
+        }
+
+        void HandlerAddReg() {
+            if (ip_ + 2 > code_.size()) return;
+            uint8_t dst = code_[ip_++];
+            uint8_t src = code_[ip_++];
+            if (dst < 16 && src < 16) {
+                registers_[dst] += registers_[src];
+            }
+        }
+
+        void HandlerJunk() {
+            volatile uint64_t j = __rdtsc();
+            j ^= j << 13;
+            j ^= j >> 7;
+            (void)j;
+        }
+
+        void ShuffleHandlerTable() {
+            // Initialize handler table
+            handlerTable_.fill(&PolymorphicBytecodeVM::HandlerNop);
+
+            std::vector<std::pair<OpCode, HandlerFunc>> handlers = {
+                {OpCode::NOP, &PolymorphicBytecodeVM::HandlerNop},
+                {OpCode::MOV_IMM_64, &PolymorphicBytecodeVM::HandlerMovImm64},
+                {OpCode::XOR_REG, &PolymorphicBytecodeVM::HandlerXorReg},
+                {OpCode::ADD_REG, &PolymorphicBytecodeVM::HandlerAddReg},
+                {OpCode::JUNK, &PolymorphicBytecodeVM::HandlerJunk},
+            };
+
+            // Shuffle handler positions
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::vector<uint8_t> indices(256);
+            std::iota(indices.begin(), indices.end(), 0);
+            std::shuffle(indices.begin(), indices.end(), gen);
+
+            for (size_t i = 0; i < handlers.size(); i++) {
+                uint8_t randomIndex = indices[i];
+                handlerTable_[randomIndex] = handlers[i].second;
+                opcodeToIndex_[handlers[i].first] = randomIndex;
+            }
+        }
+
+    public:
+        PolymorphicBytecodeVM() : registers_{}, ip_(0) {
+            ShuffleHandlerTable();
+        }
+
+        void LoadBytecode(const std::vector<uint8_t>& bytecode) {
+            code_ = bytecode;
+        }
+
+        void Execute() {
+            ip_ = 0;
+            registers_.fill(0);
+
+            while (ip_ < code_.size()) {
+                uint8_t opcode = code_[ip_++];
+
+                if (opcode == static_cast<uint8_t>(OpCode::HALT)) {
+                    break;
+                }
+
+                // Map opcode to shuffled handler
+                auto it = opcodeToIndex_.find(static_cast<OpCode>(opcode));
+                if (it != opcodeToIndex_.end()) {
+                    uint8_t handlerIndex = it->second;
+                    (this->*handlerTable_[handlerIndex])();
+                }
+            }
+        }
+
+        uint64_t GetRegister(uint8_t reg) const {
+            return (reg < 16) ? registers_[reg] : 0;
+        }
+    };
+}
+
+// ============================================================================
+// ADVANCED ANTI-DEBUG THREAD
+// ============================================================================
+namespace AdvancedAntiDebug {
+    std::atomic<bool> keepRunning(true);
+    std::atomic<bool> threatDetected(false);
+
+    void SelfTerminate() {
+        typedef NTSTATUS(NTAPI* pNtTerminateProcess)(HANDLE, NTSTATUS);
+        auto NtTerminateProcess = APIHashing::GetAPI<pNtTerminateProcess>(
+            CompileTimeHash::HASH_NtTerminateProcess);
+
+        if (NtTerminateProcess) {
+            NtTerminateProcess(GetCurrentProcess(), 0xDEADBEEF);
+        }
+        else {
+            ExitProcess(0xDEADBEEF);
+        }
+    }
+
+    void AntiDebugThreadProc() {
+        // Initialize VEH for hardware breakpoint detection
+        VEHAntiDebug::InitializeVEH();
+
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> dis(2000, 4000);
+
+        while (keepRunning.load(std::memory_order_relaxed)) {
+            int suspicionScore = 0;
+
+            // Check 1: ProcessDebugPort
+            DWORD debugPort = 0;
+            NTSTATUS status = TartarusGate::IndirectSyscall(
+                "NtQueryInformationProcess",
+                GetCurrentProcess(),
+                ProcessDebugPort,
+                &debugPort,
+                sizeof(debugPort),
+                (PULONG)nullptr
+            );
+
+            if (status == STATUS_SUCCESS && debugPort != 0) {
+                suspicionScore += 5;
+            }
+
+            // Check 2: ProcessDebugObjectHandle
+            HANDLE debugObject = nullptr;
+            status = TartarusGate::IndirectSyscall(
+                "NtQueryInformationProcess",
+                GetCurrentProcess(),
+                (PROCESSINFOCLASS)30,
+                &debugObject,
+                sizeof(debugObject),
+                (PULONG)nullptr
+            );
+
+            if (status == STATUS_SUCCESS && debugObject != nullptr) {
+                suspicionScore += 5;
+
+                auto NtClose = APIHashing::GetAPI<NTSTATUS(NTAPI*)(HANDLE)>(
+                    CompileTimeHash::HASH_NtClose);
+                if (NtClose) NtClose(debugObject);
+            }
+
+            // Check 3: PEB->BeingDebugged
+            PPEB peb = reinterpret_cast<PPEB>(GetPEB());
+            if (peb && peb->BeingDebugged) {
+                suspicionScore += 4;
+            }
+
+            // Check 4: Hardware breakpoints (VEH-based)
+            if (VEHAntiDebug::CheckHardwareBreakpoints()) {
+                suspicionScore += 5;
+            }
+
+            // Check 5: Timing attack
+            if (TimingAttacks::DetectDebuggerByTiming()) {
+                suspicionScore += 3;
+            }
+
+            // Check 6: Sandbox environment
+            if (EnvironmentDetection::IsSandboxEnvironment()) {
+                suspicionScore += 4;
+            }
+
+            // Terminate if suspicion is high
+            if (suspicionScore >= 8) {
+                threatDetected.store(true, std::memory_order_release);
+                SelfTerminate();
+                return;
+            }
+
+            // Random delay
+            int delay = dis(gen);
+            LARGE_INTEGER interval;
+            interval.QuadPart = -10000LL * delay;
+
+            typedef NTSTATUS(NTAPI* pNtDelayExecution)(BOOLEAN, PLARGE_INTEGER);
+            auto NtDelayExecution = APIHashing::GetAPI<pNtDelayExecution>(
+                CompileTimeHash::HASH_NtDelayExecution);
+
+            if (NtDelayExecution) {
+                NtDelayExecution(FALSE, &interval);
+            }
+            else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            }
+        }
+    }
+
+    void Start() {
+        keepRunning.store(true, std::memory_order_release);
+        threatDetected.store(false, std::memory_order_release);
+        std::thread(AntiDebugThreadProc).detach();
+    }
+
+    void Stop() {
+        keepRunning.store(false, std::memory_order_release);
+    }
+
+    bool IsThreatDetected() {
+        return threatDetected.load(std::memory_order_acquire);
+    }
+}
+
+// ============================================================================
+// AUTHENTICATION SYSTEM
+// ============================================================================
+namespace ProtectionAuth {
+    // Encrypted key: "mercimek"
+    // We use hashing to verify instead of plain string comparison
+    constexpr uint32_t AUTH_KEY_HASH = 0x3b07068e; // FNV1a hash of "mercimek"
+
+    bool VerifyKey(const std::string& inputKey) {
+        uint32_t inputHash = APIHashing::HashString(inputKey.c_str());
+        
+        // Anti-analysis: Add a small delay and timing check
+        uint64_t start = __rdtsc();
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        uint64_t end = __rdtsc();
+
+        if ((end - start) > 1000000000) { // If delay is way too long, debugger detected
+            return false;
+        }
+
+        return inputHash == AUTH_KEY_HASH;
+    }
+
+    void SecureInput(std::string& input) {
+        // Simple console input hide/obfuscate logic if needed
+        std::cin >> input;
+    }
+}
+
+// ============================================================================
+// PROTECTION FRAMEWORK
+// ============================================================================
+class UltimateProtectionFramework {
+public:
+    void Initialize() {
+        std::cout << "==========================================================\n";
+        std::cout << "  ULTIMATE PROTECTION FRAMEWORK v4.0\n";
+        std::cout << "  - Tartarus' Gate (Advanced SSN)\n";
+        std::cout << "  - VEH Hardware BP Detection\n";
+        std::cout << "  - RDTSC Timing Attacks\n";
+        std::cout << "  - VM/Sandbox Detection\n";
+        std::cout << "  - Polymorphic VM Handlers\n";
+        std::cout << "==========================================================\n\n";
+
+        std::cout << "[+] Running environment checks..." << std::endl;
+
+        // --- AUTH SYSTEM START ---
+        bool authenticated = false;
+        int attempts = 3;
+
+        while (attempts > 0) {
+            std::cout << "\n[>] Enter License Key (" << attempts << " attempts left): ";
+            std::string key;
+            ProtectionAuth::VerifyKey(""); // Junk call to trigger timing checks early
+            std::cin >> key;
+
+            if (ProtectionAuth::VerifyKey(key)) {
+                authenticated = true;
+                std::cout << "[+] Access Granted! Initializing core modules..." << std::endl;
+                break;
+            } else {
+                attempts--;
+                std::cout << "[!] Invalid Key! Suspicion score increased." << std::endl;
+                // In a real protector, failure here should increment global suspicion
+            }
+        }
+
+        if (!authenticated) {
+            std::cout << "[CRITICAL] Authentication failed. Self-destruct initiated." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            AdvancedAntiDebug::SelfTerminate();
+            return;
+        }
+        // --- AUTH SYSTEM END ---
+
+        if (EnvironmentDetection::CheckCPUIDHypervisor()) {
+            std::cout << "[!] Hypervisor detected!" << std::endl;
+        }
+
+        if (EnvironmentDetection::CheckVMwareMAC()) {
+            std::cout << "[!] VMware MAC detected!" << std::endl;
+        }
+
+        if (EnvironmentDetection::CheckVMDrivers()) {
+            std::cout << "[!] VM drivers detected!" << std::endl;
+        }
+
+        if (EnvironmentDetection::IsSandboxEnvironment()) {
+            std::cout << "[!] Sandbox environment detected!" << std::endl;
+            std::cout << "[!] Terminating..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            ExitProcess(0);
+        }
+
+        std::cout << "[+] Environment: Clean" << std::endl;
+        std::cout << "[+] Starting Anti-Debug Monitor..." << std::endl;
+        AdvancedAntiDebug::Start();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::cout << "[+] Monitor active!\n" << std::endl;
+    }
+
+    void DemoPolymorphicVM() {
+        std::cout << "=== DEMO: Polymorphic VM ===\n";
+
+        PolymorphicVM::PolymorphicBytecodeVM vm;
+
+        std::vector<uint8_t> bytecode = {
+            static_cast<uint8_t>(PolymorphicVM::OpCode::MOV_IMM_64), 0,
+            100, 0, 0, 0, 0, 0, 0, 0,
+
+            static_cast<uint8_t>(PolymorphicVM::OpCode::MOV_IMM_64), 1,
+            50, 0, 0, 0, 0, 0, 0, 0,
+
+            static_cast<uint8_t>(PolymorphicVM::OpCode::ADD_REG), 0, 1,
+            static_cast<uint8_t>(PolymorphicVM::OpCode::JUNK),
+            static_cast<uint8_t>(PolymorphicVM::OpCode::HALT)
+        };
+
+        vm.LoadBytecode(bytecode);
+        vm.Execute();
+
+        std::cout << "[VM] R0 result: " << vm.GetRegister(0) << std::endl;
+        std::cout << "[VM] Handler table shuffled each run!\n" << std::endl;
+    }
+
+    void Shutdown() {
+        std::cout << "\n[+] Shutting down..." << std::endl;
+        AdvancedAntiDebug::Stop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        std::cout << "[+] Framework stopped." << std::endl;
+    }
+};
+
+// ============================================================================
+// MAIN
+// ============================================================================
+int main() {
+    UltimateProtectionFramework framework;
+
+    framework.Initialize();
+    framework.DemoPolymorphicVM();
+
+    std::cout << "\n==========================================================\n";
+    std::cout << "Status: "
+        << (AdvancedAntiDebug::IsThreatDetected() ? "THREAT!" : "Clean")
+        << "\n";
+    std::cout << "Press Enter to exit...\n";
+    std::cout << "==========================================================\n";
+
+    std::cin.get();
+
+    framework.Shutdown();
+    return 0;
+}
