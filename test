@@ -96,7 +96,7 @@ namespace CompileTimeHash {
     #define OBFUSCATE(str, key) ([]() { \
         constexpr auto obfuscated = CompileTimeHash::ObfuscatedString<sizeof(str)>(str, key); \
         std::string decrypted = ""; \
-        for(size_t i = 0; i < sizeof(str); ++i) decrypted += (obfuscated.data[i] ^ key); \
+        for(size_t i = 0; i < sizeof(str) - 1; ++i) decrypted += (obfuscated.data[i] ^ key); \
         return decrypted; \
     }())
 }
@@ -859,23 +859,21 @@ namespace AdvancedAntiDebug {
 // AUTHENTICATION SYSTEM
 // ============================================================================
 namespace ProtectionAuth {
-    // Encrypted key: "mercimek"
-    // We use hashing to verify instead of plain string comparison
-    constexpr uint32_t AUTH_KEY_HASH = 0x3b07068e; // FNV1a hash of "mercimek"
-
     bool VerifyKey(const std::string& inputKey) {
-        uint32_t inputHash = APIHashing::HashString(inputKey.c_str());
+        // Obfuscated comparison to prevent hash mismatch
+        std::string correctKey = OBFUSCATE("mercimek", 0x42);
         
         // Anti-analysis: Add a small delay and timing check
         uint64_t start = __rdtsc();
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
         uint64_t end = __rdtsc();
 
-        if ((end - start) > 1000000000) { // If delay is way too long, debugger detected
+        // Timing check relaxed even further to avoid any environment-specific jitter
+        if ((end - start) > 5000000000) { 
             return false;
         }
 
-        return inputHash == AUTH_KEY_HASH;
+        return inputKey == correctKey;
     }
 
     void SecureInput(std::string& input) {
@@ -902,32 +900,17 @@ public:
         std::cout << "[+] Running environment checks..." << std::endl;
 
         // --- AUTH SYSTEM START ---
-        bool authenticated = false;
-        int attempts = 3;
+        std::cout << "\n[>] Enter License Key: ";
+        std::string key;
+        std::cin >> key;
 
-        while (attempts > 0) {
-            std::cout << "\n[>] Enter License Key (" << attempts << " attempts left): ";
-            std::string key;
-            ProtectionAuth::VerifyKey(""); // Junk call to trigger timing checks early
-            std::cin >> key;
-
-            if (ProtectionAuth::VerifyKey(key)) {
-                authenticated = true;
-                std::cout << "[+] Access Granted! Initializing core modules..." << std::endl;
-                break;
-            } else {
-                attempts--;
-                std::cout << "[!] Invalid Key! Suspicion score increased." << std::endl;
-                // In a real protector, failure here should increment global suspicion
-            }
-        }
-
-        if (!authenticated) {
-            std::cout << "[CRITICAL] Authentication failed. Self-destruct initiated." << std::endl;
+        if (!ProtectionAuth::VerifyKey(key)) {
+            std::cout << "[!] Invalid Key or Debugger Detected! Self-destruct initiated." << std::endl;
             std::this_thread::sleep_for(std::chrono::seconds(1));
             AdvancedAntiDebug::SelfTerminate();
             return;
         }
+        std::cout << "[+] Access Granted! Initializing core modules..." << std::endl;
         // --- AUTH SYSTEM END ---
 
         if (EnvironmentDetection::CheckCPUIDHypervisor()) {
